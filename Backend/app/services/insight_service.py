@@ -81,12 +81,16 @@ def _fallback_insight(cluster: Dict) -> str:
         )
 
 
+MAX_LLM_CALLS = 2  # 🚀 only call Gemini for top clusters
+
 async def generate_all_insights(analyzed_clusters: List[Dict]) -> List[Dict]:
-    """Generate insights for all clusters."""
     insights = []
 
-    for cluster in analyzed_clusters:
-        insight_text = await generate_insight_gemini(cluster)
+    for i, cluster in enumerate(analyzed_clusters):
+        if i < MAX_LLM_CALLS:
+            insight_text = await generate_insight_gemini(cluster)
+        else:
+            insight_text = _fallback_insight(cluster)
 
         insights.append({
             "cluster_id": cluster["id"],

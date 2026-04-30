@@ -1,0 +1,1868 @@
+Directory structure:
+└── Research_Tracker/
+    ├── Backend/
+    │   ├── requirements.txt
+    │   └── app/
+    │       ├── main.py
+    │       ├── models/
+    │       │   └── schema.py
+    │       ├── routes/
+    │       │   └── research.py
+    │       ├── services/
+    │       │   ├── analysis_service.py
+    │       │   ├── arxiv_service.py
+    │       │   ├── clustering_service.py
+    │       │   ├── embedding_service.py
+    │       │   └── insight_service.py
+    │       └── utils/
+    │           └── text_cleaner.py
+    └── frontend/
+        ├── README.md
+        ├── eslint.config.js
+        ├── index.html
+        ├── package.json
+        ├── postcss.config.js
+        ├── tailwind.config.js
+        ├── vite.config.js
+        └── src/
+            ├── api.js
+            ├── App.jsx
+            ├── index.css
+            ├── main.jsx
+            ├── mockData.js
+            ├── components/
+            │   ├── FloatingAddButton.jsx
+            │   ├── GapList.jsx
+            │   ├── KnowledgeGraph.jsx
+            │   ├── Layout.jsx
+            │   ├── PaperDetailModal.jsx
+            │   ├── SummaryCards.jsx
+            │   └── TrendChart.jsx
+            └── pages/
+                ├── DashboardPage.jsx
+                └── HomePage.jsx
+
+================================================
+FILE: Backend/requirements.txt
+================================================
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+httpx==0.27.0
+sentence-transformers==2.7.0
+scikit-learn==1.4.2
+numpy==1.26.4
+pydantic==2.7.1
+python-dotenv==1.0.1
+google-genai
+
+
+
+================================================
+FILE: Backend/app/main.py
+================================================
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.routes.research import router
+
+app = FastAPI(
+    title="Research Radar API",
+    description="AI-powered research gap detection engine",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router, prefix="/api")
+
+@app.get("/")
+def root():
+    return {"message": "Research Radar API is live ðŸš€"}
+
+
+================================================
+FILE: Backend/app/models/schema.py
+================================================
+from pydantic import BaseModel
+from typing import List, Optional
+
+class TopicRequest(BaseModel):
+    topic: str
+    max_papers: Optional[int] = 50
+    num_clusters: Optional[int] = 5
+
+class PaperSchema(BaseModel):
+    title: str
+    abstract: str
+    year: int
+
+class ClusterSchema(BaseModel):
+    id: int
+    name: str
+    papers: int
+    status: str  # "Mature" | "Growing" | "Gap"
+    top_keywords: List[str]
+    recent_ratio: float
+
+class InsightSchema(BaseModel):
+    cluster_id: int
+    cluster_name: str
+    insight: str
+
+class AnalysisResponse(BaseModel):
+    topic: str
+    total_papers: int
+    clusters: List[ClusterSchema]
+    insights: List[InsightSchema]
+
+
+================================================
+FILE: Backend/app/routes/research.py
+================================================
+from fastapi import APIRouter, HTTPException
+from app.models.schema import TopicRequest, AnalysisResponse, ClusterSchema, InsightSchema
+from app.services.arxiv_service import fetch_papers
+from app.services.embedding_service import generate_embeddings
+from app.services.clustering_service import cluster_papers, build_clusters
+from app.services.analysis_service import analyze_clusters
+from app.services.insight_service import generate_all_insights
+from app.utils.text_cleaner import clean_papers
+import numpy as np
+
+router = APIRouter()
+
+
+@router.post("/analyze-topic", response_model=AnalysisResponse)
+async def analyze_topic(request: TopicRequest):
+    """
+    Full pipeline:
+    1. Fetch papers from arXiv
+    2. Clean text
+    3. Generate embeddings
+    4. Cluster papers
+    5. Analyze cluster status
+    6. Generate LLM insights
+    7. Return structured response
+    """
+    # Step 1: Fetch papers
+    papers = await fetch_papers(request.topic, max_results=request.max_papers)
+    if not papers:
+        raise HTTPException(status_code=404, detail=f"No papers found for topic: {request.topic}")
+
+    # Step 2: Clean text
+    papers = clean_papers(papers)
+
+    # Step 3: Embed
+    texts = [p["text"] for p in papers]
+    embeddings = generate_embeddings(texts)
+
+    # Step 4: Cluster
+    n_clusters = min(request.num_clusters, len(papers))
+    labels = cluster_papers(embeddings, n_clusters=n_clusters)
+    clusters = build_clusters(papers, labels, n_clusters)
+
+    # Step 5: Analyze status
+    analyzed = analyze_clusters(clusters)
+
+    # Step 6: Generate insights
+    insights_data = await generate_all_insights(analyzed)
+
+    # Step 7: Build response
+    cluster_schemas = [
+        ClusterSchema(
+            id=c["id"],
+            name=c["name"],
+            papers=c["paper_count"],
+            status=c["status"],
+            top_keywords=c.get("keywords", []),
+            recent_ratio=c["recent_ratio"]
+        )
+        for c in analyzed
+    ]
+
+    insight_schemas = [
+        InsightSchema(
+            cluster_id=i["cluster_id"],
+            cluster_name=i["cluster_name"],
+            insight=i["insight"]
+        )
+        for i in insights_data
+    ]
+
+    return AnalysisResponse(
+        topic=request.topic,
+        total_papers=len(papers),
+        clusters=cluster_schemas,
+        insights=insight_schemas
+    )
+
+
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+================================================
+FILE: Backend/app/services/analysis_service.py
+================================================
+from typing import List, Dict
+from datetime import datetime
+
+CURRENT_YEAR = datetime.now().year
+RECENT_THRESHOLD = CURRENT_YEAR - 4  # Last 4 years = "recent"
+
+
+def classify_status(paper_count: int, recent_count: int) -> str:
+    """
+    Core hackathon logic to classify research maturity.
+    
+    - Mature: well-researched area (many papers)
+    - Growing: emerging field (mostly recent papers)
+    - Gap: underexplored area (few papers, mostly old)
+    """
+    if paper_count == 0:
+        return "Gap"
+
+    recent_ratio = recent_count / paper_count
+
+    if paper_count > 20:
+        return "Mature"
+    elif recent_ratio > 0.6:
+        return "Growing"
+    else:
+        return "Gap"
+
+
+def analyze_clusters(clusters: List[Dict]) -> List[Dict]:
+    """
+    Analyze each cluster and attach status, recent_ratio to each.
+    """
+    analyzed = []
+
+    for cluster in clusters:
+        papers = cluster["papers"]
+        paper_count = len(papers)
+        recent_count = sum(1 for p in papers if p.get("year", 0) >= RECENT_THRESHOLD)
+        recent_ratio = round(recent_count / paper_count, 2) if paper_count > 0 else 0.0
+
+        status = classify_status(paper_count, recent_count)
+
+        analyzed.append({
+            **cluster,
+            "paper_count": paper_count,
+            "recent_count": recent_count,
+            "recent_ratio": recent_ratio,
+            "status": status
+        })
+
+    return analyzed
+
+
+================================================
+FILE: Backend/app/services/arxiv_service.py
+================================================
+import httpx
+import xml.etree.ElementTree as ET
+from typing import List, Dict
+from datetime import datetime
+
+ARXIV_BASE_URL = "https://export.arxiv.org/api/query"
+
+async def fetch_papers(topic: str, max_results: int = 50) -> List[Dict]:
+    """
+    Fetch papers from arXiv API for a given topic.
+    Returns list of {title, abstract, year} dicts.
+    """
+    params = {
+        "search_query": f"all:{topic}",
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "relevance",
+        "sortOrder": "descending"
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(ARXIV_BASE_URL, params=params)
+        response.raise_for_status()
+
+    papers = _parse_arxiv_xml(response.text)
+    return papers
+
+
+def _parse_arxiv_xml(xml_text: str) -> List[Dict]:
+    """Parse arXiv Atom XML and extract title, abstract, year."""
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom"
+    }
+
+    root = ET.fromstring(xml_text)
+    papers = []
+
+    for entry in root.findall("atom:entry", ns):
+        title_el = entry.find("atom:title", ns)
+        abstract_el = entry.find("atom:summary", ns)
+        published_el = entry.find("atom:published", ns)
+
+        if title_el is None or abstract_el is None:
+            continue
+
+        title = title_el.text.strip().replace("\n", " ")
+        abstract = abstract_el.text.strip().replace("\n", " ")
+
+        year = datetime.now().year
+        if published_el is not None:
+            try:
+                year = int(published_el.text[:4])
+            except (ValueError, TypeError):
+                pass
+
+        papers.append({
+            "title": title,
+            "abstract": abstract,
+            "year": year,
+            "text": f"{title}. {abstract}"
+        })
+
+    return papers
+
+
+================================================
+FILE: Backend/app/services/clustering_service.py
+================================================
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
+from typing import List, Dict, Tuple
+
+
+def cluster_papers(embeddings: np.ndarray, n_clusters: int = 5) -> np.ndarray:
+    """
+    Cluster paper embeddings using KMeans.
+    Returns array of cluster labels.
+    """
+    n_clusters = min(n_clusters, len(embeddings))
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        random_state=42,
+        n_init=10
+    )
+    labels = kmeans.fit_predict(embeddings)
+    return labels
+
+
+def extract_cluster_keywords(papers: List[Dict], labels: np.ndarray, cluster_id: int, top_n: int = 5) -> List[str]:
+    """
+    Extract top TF-IDF keywords for a specific cluster.
+    """
+    cluster_texts = [
+        p["text"] for p, label in zip(papers, labels) if label == cluster_id
+    ]
+
+    if not cluster_texts:
+        return []
+
+    try:
+        vectorizer = TfidfVectorizer(
+            max_features=100,
+            stop_words='english',
+            ngram_range=(1, 2)
+        )
+        tfidf_matrix = vectorizer.fit_transform(cluster_texts)
+        feature_names = vectorizer.get_feature_names_out()
+        mean_scores = np.asarray(tfidf_matrix.mean(axis=0)).flatten()
+        top_indices = mean_scores.argsort()[-top_n:][::-1]
+        keywords = [feature_names[i] for i in top_indices]
+        return keywords
+    except Exception:
+        return []
+
+
+def name_cluster(keywords: List[str]) -> str:
+    """
+    Generate a human-readable cluster name from keywords.
+    Capitalizes the top 2-3 keywords.
+    """
+    if not keywords:
+        return "General Research"
+    # Use top 2 keywords, title-cased
+    name_parts = [k.title() for k in keywords[:2]]
+    return " & ".join(name_parts)
+
+
+def build_clusters(papers: List[Dict], labels: np.ndarray, n_clusters: int) -> List[Dict]:
+    """
+    Build cluster summary dicts with names, paper lists, and metadata.
+    """
+    clusters = []
+    for cluster_id in range(n_clusters):
+        cluster_papers = [
+            p for p, label in zip(papers, labels) if label == cluster_id
+        ]
+        if not cluster_papers:
+            continue
+
+        keywords = extract_cluster_keywords(papers, labels, cluster_id)
+        name = name_cluster(keywords)
+
+        clusters.append({
+            "id": cluster_id,
+            "name": name,
+            "papers": cluster_papers,
+            "keywords": keywords
+        })
+
+    return clusters
+
+
+================================================
+FILE: Backend/app/services/embedding_service.py
+================================================
+from sentence_transformers import SentenceTransformer
+from typing import List
+import numpy as np
+
+# Load once at module level (cached after first load)
+_model = None
+
+def get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        print("Loading embedding model... (first time only)")
+        _model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _model
+
+
+def generate_embeddings(texts: List[str]) -> np.ndarray:
+    """
+    Convert list of texts into embedding vectors.
+    Returns numpy array of shape (n_texts, embedding_dim).
+    """
+    model = get_model()
+    embeddings = model.encode(
+        texts,
+        batch_size=32,
+        show_progress_bar=False,
+        normalize_embeddings=True
+    )
+    return embeddings
+
+
+================================================
+FILE: Backend/app/services/insight_service.py
+================================================
+import os
+from typing import List, Dict
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Initialize model
+model = genai.GenerativeModel("gemini-2.5-flash")
+
+
+def _build_prompt(cluster: Dict) -> str:
+    topic_name = cluster["name"]
+    status = cluster["status"]
+    keywords = ", ".join(cluster.get("keywords", []))
+    paper_count = cluster["paper_count"]
+    recent_ratio = cluster["recent_ratio"]
+
+    return f"""
+You are a research analyst.
+
+Given the following research cluster data, generate ONE concise insight (max 2 sentences) about the research landscape.
+
+Cluster: {topic_name}
+Status: {status}
+Key topics: {keywords}
+Papers found: {paper_count}
+Recent paper ratio: {recent_ratio:.0%}
+
+Instructions:
+- If Gap â†’ highlight research opportunity
+- If Growing â†’ highlight momentum
+- If Mature â†’ highlight stability and next directions
+
+Return ONLY the insight. No labels.
+"""
+
+
+async def generate_insight_gemini(cluster: Dict) -> str:
+    """Generate insight using Google Gemini."""
+    prompt = _build_prompt(cluster)
+
+    try:
+        response = model.generate_content(prompt)
+
+        if response and hasattr(response, "text"):
+            return response.text.strip()
+
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+
+    # Fallback if Gemini fails
+    return _fallback_insight(cluster)
+
+
+def _fallback_insight(cluster: Dict) -> str:
+    """Rule-based fallback insights when LLM is unavailable."""
+    name = cluster["name"]
+    status = cluster["status"]
+    keywords = cluster.get("keywords", [])
+    kw = keywords[0] if keywords else "this area"
+
+    if status == "Gap":
+        return (
+            f"'{name}' is underexplored with only {cluster['paper_count']} papers. "
+            f"This presents a strong research opportunity in {kw}."
+        )
+    elif status == "Growing":
+        return (
+            f"'{name}' is gaining momentum with {cluster['recent_ratio']:.0%} recent papers. "
+            f"This is an emerging area worth exploring."
+        )
+    else:
+        return (
+            f"'{name}' is a well-established field with {cluster['paper_count']} papers. "
+            f"Future work could explore advanced applications in {kw}."
+        )
+
+
+async def generate_all_insights(analyzed_clusters: List[Dict]) -> List[Dict]:
+    """Generate insights for all clusters."""
+    insights = []
+
+    for cluster in analyzed_clusters:
+        insight_text = await generate_insight_gemini(cluster)
+
+        insights.append({
+            "cluster_id": cluster["id"],
+            "cluster_name": cluster["name"],
+            "status": cluster["status"],
+            "insight": insight_text
+        })
+
+    return insights
+
+
+================================================
+FILE: Backend/app/utils/text_cleaner.py
+================================================
+import re
+from typing import List, Dict
+
+def clean_text(text: str) -> str:
+    """Remove LaTeX, special chars, and normalize whitespace."""
+    # Remove LaTeX math blocks
+    text = re.sub(r'\$[^$]*\$', '', text)
+    text = re.sub(r'\\\w+\{[^}]*\}', '', text)
+    # Remove special characters except periods and commas
+    text = re.sub(r'[^\w\s.,;:()\-]', ' ', text)
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def clean_papers(papers: List[Dict]) -> List[Dict]:
+    """Clean text field for all papers."""
+    cleaned = []
+    for p in papers:
+        p_copy = p.copy()
+        p_copy["text"] = clean_text(p["text"])
+        p_copy["title"] = clean_text(p["title"])
+        p_copy["abstract"] = clean_text(p["abstract"])
+        cleaned.append(p_copy)
+    return cleaned
+
+
+================================================
+FILE: frontend/README.md
+================================================
+# React + Vite
+
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+
+Currently, two official plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+
+
+
+================================================
+FILE: frontend/eslint.config.js
+================================================
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{js,jsx}'],
+    extends: [
+      js.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      globals: globals.browser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+  },
+])
+
+
+
+================================================
+FILE: frontend/index.html
+================================================
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Research Tracker | Visualize Research Landscape</title>
+  </head>
+  <body class="bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-800">
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+================================================
+FILE: frontend/package.json
+================================================
+{
+  "name": "research-tracker",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^0.476.0",
+    "react": "^18.3.1",
+    "react-countup": "^6.5.3",
+    "react-dom": "^18.3.1",
+    "react-force-graph-2d": "^1.29.1",
+    "react-router-dom": "^7.14.2",
+    "recharts": "^2.15.4"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.5.0",
+    "postcss": "^8.5.12",
+    "tailwindcss": "^3.4.19",
+    "vite": "^5.4.10"
+  }
+}
+
+
+
+================================================
+FILE: frontend/postcss.config.js
+================================================
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+
+
+================================================
+FILE: frontend/tailwind.config.js
+================================================
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  darkMode: 'class',
+  theme: {
+    extend: {
+      animation: {
+        'fade-slide-up': 'fadeSlideUp 0.5s ease-out forwards',
+        'scale-soft': 'scaleSoft 0.3s ease-out forwards',
+        'shimmer': 'shimmer 2s infinite linear',
+        'gradient': 'gradient 6s ease infinite',
+      },
+      keyframes: {
+        fadeSlideUp: {
+          '0%': { opacity: '0', transform: 'translateY(20px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        scaleSoft: {
+          '0%': { opacity: '0', transform: 'scale(0.95)' },
+          '100%': { opacity: '1', transform: 'scale(1)' },
+        },
+        shimmer: {
+          '0%': { backgroundPosition: '-1000px 0' },
+          '100%': { backgroundPosition: '1000px 0' },
+        },
+        gradient: {
+          '0%, 100%': { backgroundPosition: '0% 50%' },
+          '50%': { backgroundPosition: '100% 50%' },
+        },
+      },
+      backgroundSize: {
+        '300%': '300%',
+      },
+    },
+  },
+  plugins: [],
+}
+
+
+================================================
+FILE: frontend/vite.config.js
+================================================
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 3000,
+    open: true,
+  },
+})
+
+
+================================================
+FILE: frontend/src/api.js
+================================================
+// src/services/api.js
+
+const API_BASE = "http://127.0.0.1:8000/api";
+
+// ðŸ”¹ MAIN API CALL
+export const analyzeTopic = async (topic) => {
+  try {
+    const response = await fetch(`${API_BASE}/analyze-topic`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        topic: topic,
+        max_papers: 50,
+        num_clusters: 5,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error("Failed to fetch analysis");
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error("API Error:", error);
+    return null;
+  }
+};
+
+
+// ðŸ”¹ KNOWLEDGE GRAPH (convert clusters â†’ nodes)
+export const fetchKnowledgeGraph = async (topic) => {
+  const data = await analyzeTopic(topic);
+  if (!data) return null;
+
+  return {
+    nodes: data.clusters.map((c) => ({
+      id: c.id,
+      label: c.name,
+      size: c.papers,
+      status: c.status,
+      keywords: c.top_keywords,
+    })),
+    edges: [], // (you can improve later)
+  };
+};
+
+
+// ðŸ”¹ TREND DATA (for charts)
+export const fetchTrendData = async (topic) => {
+  const data = await analyzeTopic(topic);
+  if (!data) return [];
+
+  return data.clusters.map((c) => ({
+    name: c.name,
+    papers: c.papers,
+    recent: c.recent_ratio,
+  }));
+};
+
+
+// ðŸ”¹ GAP LIST
+export const fetchGapList = async (topic, filter = "all") => {
+  const data = await analyzeTopic(topic);
+  if (!data) return [];
+
+  let clusters = data.clusters;
+
+  if (filter === "unexplored") {
+    clusters = clusters.filter((c) => c.status === "Gap");
+  } else if (filter === "ongoing") {
+    clusters = clusters.filter((c) => c.status === "Growing");
+  }
+
+  return clusters.map((c) => ({
+    id: c.id,
+    title: c.name,
+    papers: c.papers,
+    keywords: c.top_keywords,
+    status: c.status,
+  }));
+};
+
+
+// ðŸ”¹ STATS
+export const fetchStats = async (topic) => {
+  const data = await analyzeTopic(topic);
+  if (!data) return null;
+
+  return {
+    totalPapers: data.total_papers,
+    totalClusters: data.clusters.length,
+    gapCount: data.clusters.filter((c) => c.status === "Gap").length,
+    growingCount: data.clusters.filter((c) => c.status === "Growing").length,
+    matureCount: data.clusters.filter((c) => c.status === "Mature").length,
+  };
+};
+
+
+// ðŸ”¹ PAPERS FOR NODE (optional fallback)
+export const fetchPapersForNode = async (nodeId, topic) => {
+  const data = await analyzeTopic(topic);
+  if (!data) return [];
+
+  const cluster = data.clusters.find((c) => c.id === nodeId);
+
+  return cluster
+    ? cluster.top_keywords.map((kw, i) => ({
+        id: i,
+        title: `Research on ${kw}`,
+      }))
+    : [];
+};
+
+
+================================================
+FILE: frontend/src/App.jsx
+================================================
+import React from 'react'
+import { Routes, Route } from 'react-router-dom'
+import { motion, AnimatePresence } from 'framer-motion'
+import Layout from './components/Layout'
+import HomePage from './pages/HomePage'
+import DashboardPage from './pages/DashboardPage'
+
+function App() {
+  return (
+    <AnimatePresence mode="wait">
+      <Routes>
+        <Route path="/" element={
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <Layout>
+              <HomePage />
+            </Layout>
+          </motion.div>
+        } />
+        <Route path="/dashboard/:topicId" element={
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            transition={{ duration: 0.4 }}
+          >
+            <Layout>
+              <DashboardPage />
+            </Layout>
+          </motion.div>
+        } />
+      </Routes>
+    </AnimatePresence>
+  )
+}
+
+export default App
+
+
+================================================
+FILE: frontend/src/index.css
+================================================
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply antialiased;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply backdrop-blur-md bg-white/30 dark:bg-gray-900/40 rounded-2xl shadow-xl border border-white/20;
+  }
+  
+  .glass-card-hover {
+    @apply backdrop-blur-md bg-white/40 dark:bg-gray-900/50 rounded-2xl shadow-2xl border border-white/30 hover:bg-white/50 dark:hover:bg-gray-900/60 transition-all duration-300;
+  }
+  
+  .gradient-text {
+    @apply bg-gradient-to-r from-purple-600 via-pink-600 to-purple-600 bg-300% bg-clip-text text-transparent animate-gradient;
+  }
+}
+
+
+================================================
+FILE: frontend/src/main.jsx
+================================================
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import App from './App'
+import './index.css'
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+)
+
+
+================================================
+FILE: frontend/src/mockData.js
+================================================
+export const getKnowledgeGraph = (topicId = 'ai') => {
+  const nodes = [
+    { id: 'transformer', label: 'Transformer Architectures', status: 'solved', val: 35, description: 'Landmark architecture that revolutionized NLP' },
+    { id: 'rlhf', label: 'RLHF', status: 'ongoing', val: 28, description: 'Reinforcement Learning from Human Feedback' },
+    { id: 'multimodal', label: 'Multi-modal Alignment', status: 'unexplored', val: 12, description: 'Aligning vision, language, and audio' },
+    { id: 'llm-scaling', label: 'LLM Scaling Laws', status: 'ongoing', val: 42, description: 'Understanding how performance scales with size' },
+    { id: 'safety', label: 'AI Safety', status: 'ongoing', val: 22, description: 'Ensuring AI systems behave safely' },
+    { id: 'few-shot', label: 'Few-shot Learning', status: 'solved', val: 18, description: 'Learning from minimal examples' },
+    { id: 'interpretability', label: 'Model Interpretability', status: 'unexplored', val: 8, description: 'Understanding internal representations' },
+    { id: 'efficient-attention', label: 'Efficient Attention', status: 'solved', val: 25, description: 'Linear and sparse attention mechanisms' },
+    { id: 'embodied-ai', label: 'Embodied AI', status: 'unexplored', val: 6, description: 'AI in physical environments' },
+    { id: 'reasoning', label: 'Logical Reasoning', status: 'ongoing', val: 30, description: 'Multi-step reasoning capabilities' },
+  ]
+
+  const links = [
+    { source: 'transformer', target: 'llm-scaling', value: 25 },
+    { source: 'transformer', target: 'efficient-attention', value: 20 },
+    { source: 'transformer', target: 'few-shot', value: 15 },
+    { source: 'rlhf', target: 'safety', value: 18 },
+    { source: 'llm-scaling', target: 'reasoning', value: 22 },
+    { source: 'multimodal', target: 'embodied-ai', value: 10 },
+    { source: 'safety', target: 'interpretability', value: 14 },
+    { source: 'reasoning', target: 'interpretability', value: 12 },
+    { source: 'rlhf', target: 'multimodal', value: 8 },
+    { source: 'efficient-attention', target: 'llm-scaling', value: 16 },
+    { source: 'few-shot', target: 'multimodal', value: 9 },
+  ]
+
+  return { nodes, links }
+}
+
+export const getTrendData = () => [
+  { year: 2019, papers: 12, citations: 450 },
+  { year: 2020, papers: 28, citations: 890 },
+  { year: 2021, papers: 54, citations: 2100 },
+  { year: 2022, papers: 89, citations: 3800 },
+  { year: 2023, papers: 145, citations: 6200 },
+  { year: 2024, papers: 210, citations: 9800 },
+  { year: 2025, papers: 278, citations: 15200 },
+]
+
+export const getGapList = () => [
+  { id: 1, title: 'Efficient Long-Context Processing', description: 'Current transformers have O(nÂ²) complexity, limiting context length', type: 'ongoing', severity: 'high' },
+  { id: 2, title: 'Hallucination Mitigation', description: 'LLMs frequently generate false or ungrounded information', type: 'ongoing', severity: 'critical' },
+  { id: 3, title: 'Cross-modal Reasoning', description: 'Bridging visual, textual, and auditory understanding', type: 'unexplored', severity: 'medium' },
+  { id: 4, title: 'Energy-efficient Training', description: 'Training large models consumes massive computational resources', type: 'ongoing', severity: 'high' },
+  { id: 5, title: 'Causal Reasoning in LLMs', description: 'Models struggle with true cause-effect understanding', type: 'unexplored', severity: 'high' },
+  { id: 6, title: 'Continual Learning Without Forgetting', description: 'Models forget previous tasks when learning new ones', type: 'ongoing', severity: 'medium' },
+]
+
+export const getStats = () => ({
+  solved: 45,
+  ongoing: 78,
+  unexplored: 34,
+  totalPapers: 2847,
+  activeResearchers: 12500,
+})
+
+export const getPapersForNode = (nodeId) => {
+  const papersMap = {
+    transformer: [
+      { title: 'Attention Is All You Need', authors: 'Vaswani et al.', year: 2017, citations: 85000, abstract: 'The original transformer paper introducing self-attention mechanisms.' },
+      { title: 'BERT: Pre-training of Deep Bidirectional Transformers', authors: 'Devlin et al.', year: 2018, citations: 52000, abstract: 'Bidirectional transformer for language understanding.' },
+    ],
+    rlhf: [
+      { title: 'Training language models to follow instructions', authors: 'Ouyang et al.', year: 2022, citations: 3500, abstract: 'Aligning language models with human preferences.' },
+    ],
+    multimodal: [
+      { title: 'Flamingo: a Visual Language Model for Few-Shot Learning', authors: 'Alayrac et al.', year: 2022, citations: 1800, abstract: 'Multi-modal learning with few-shot capabilities.' },
+    ],
+  }
+  return papersMap[nodeId] || [
+    { title: 'Sample Research Paper 1', authors: 'Research Team', year: 2023, citations: 120, abstract: 'An important contribution to this research area.' },
+    { title: 'Sample Research Paper 2', authors: 'Academic Group', year: 2024, citations: 45, abstract: 'Recent advances in this domain.' },
+  ]
+}
+
+
+================================================
+FILE: frontend/src/components/FloatingAddButton.jsx
+================================================
+import { motion } from 'framer-motion'
+import { Plus } from 'lucide-react'
+
+const FloatingAddButton = ({ onClick }) => {
+  return (
+    <motion.button
+      initial={{ scale: 0 }}
+      animate={{ scale: 1 }}
+      transition={{ type: 'spring', stiffness: 260, damping: 20 }}
+      whileHover={{ scale: 1.1 }}
+      whileTap={{ scale: 0.9 }}
+      onClick={onClick}
+      className="fixed bottom-6 right-6 z-40 w-14 h-14 bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-full shadow-2xl flex items-center justify-center hover:shadow-xl transition-all duration-300"
+    >
+      <Plus className="w-6 h-6" />
+    </motion.button>
+  )
+}
+
+export default FloatingAddButton
+
+
+================================================
+FILE: frontend/src/components/GapList.jsx
+================================================
+import React, { useState, useMemo, useCallback } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { ChevronRight, AlertCircle, Clock, Target } from 'lucide-react'
+
+const GapItem = React.memo(({ gap, onClick }) => (
+  <motion.div
+    layout
+    initial={{ opacity: 0, y: 10 }}
+    animate={{ opacity: 1, y: 0 }}
+    exit={{ opacity: 0, x: -20 }}
+    whileHover={{ scale: 1.01 }}
+    onClick={() => onClick(gap)}
+    className="glass-card p-4 rounded-xl cursor-pointer hover:shadow-xl transition-all duration-200"
+  >
+    <div className="flex items-start justify-between">
+      <div className="flex-1">
+        <div className="flex items-center flex-wrap gap-2 mb-2">
+          {gap.type === 'unexplored' ? (
+            <Target className="w-4 h-4 text-red-500" />
+          ) : (
+            <Clock className="w-4 h-4 text-yellow-500" />
+          )}
+          <h4 className="font-semibold text-gray-800 dark:text-white">{gap.title}</h4>
+          <span className={`text-xs px-2 py-0.5 rounded-full ${
+            gap.severity === 'critical' ? 'bg-red-100 text-red-700 dark:bg-red-900/30' :
+            gap.severity === 'high' ? 'bg-orange-100 text-orange-700' :
+            'bg-yellow-100 text-yellow-700'
+          }`}>{gap.severity}</span>
+        </div>
+        <p className="text-sm text-gray-600 dark:text-gray-300 line-clamp-2">{gap.description}</p>
+        <div className="flex items-center text-xs text-purple-600 mt-2">
+          <span className="capitalize">{gap.type} territory</span>
+          <ChevronRight className="w-3 h-3 ml-1" />
+        </div>
+      </div>
+      <AlertCircle className={`w-5 h-5 flex-shrink-0 ${
+        gap.severity === 'critical' ? 'text-red-500' :
+        gap.severity === 'high' ? 'text-orange-500' : 'text-yellow-500'
+      }`} />
+    </div>
+  </motion.div>
+))
+
+const GapList = ({ gaps, onGapClick, isLoading = false }) => {
+  const [filter, setFilter] = useState('all')
+
+  const filteredGaps = useMemo(() => {
+    if (filter === 'all') return gaps
+    return gaps.filter(g => g.type === filter)
+  }, [gaps, filter])
+
+  const handleClick = useCallback((gap) => {
+    onGapClick(gap)
+  }, [onGapClick])
+
+  if (isLoading) {
+    return (
+      <div className="glass-card rounded-2xl p-6">
+        <div className="flex items-center justify-center h-40">
+          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-purple-500" />
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="glass-card rounded-2xl p-6">
+      <div className="flex flex-wrap justify-between items-center mb-6 gap-4">
+        <div>
+          <h3 className="text-lg font-semibold">Research Gaps & Open Problems</h3>
+          <p className="text-sm text-gray-500">{filteredGaps.length} gaps identified</p>
+        </div>
+        <div className="flex gap-2">
+          {['all', 'unexplored', 'ongoing'].map(f => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`px-3 py-1 rounded-full text-sm font-medium transition-all ${
+                filter === f ? 'bg-purple-600 text-white shadow-md' : 'bg-gray-100 dark:bg-gray-800'
+              }`}
+            >
+              {f.charAt(0).toUpperCase() + f.slice(1)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="space-y-3 max-h-[500px] overflow-y-auto pr-1">
+        <AnimatePresence initial={false}>
+          {filteredGaps.map(gap => (
+            <GapItem key={gap.id} gap={gap} onClick={handleClick} />
+          ))}
+        </AnimatePresence>
+      </div>
+    </div>
+  )
+}
+
+export default React.memo(GapList)
+
+
+================================================
+FILE: frontend/src/components/KnowledgeGraph.jsx
+================================================
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react'
+import ForceGraph2D from 'react-force-graph-2d'
+import { motion } from 'framer-motion'
+
+const KnowledgeGraph = ({ data, onNodeClick, isLoading = false }) => {
+  const graphRef = useRef()
+  const [dimensions, setDimensions] = useState({ width: 800, height: 500 })
+
+  useEffect(() => {
+    let timeoutId
+    const updateDimensions = () => {
+      const container = document.getElementById('graph-container')
+      if (container) {
+        setDimensions({
+          width: container.clientWidth,
+          height: Math.min(container.clientHeight, 500),
+        })
+      }
+    }
+
+    const handleResize = () => {
+      clearTimeout(timeoutId)
+      timeoutId = setTimeout(updateDimensions, 150)
+    }
+
+    updateDimensions()
+    window.addEventListener('resize', handleResize)
+    return () => {
+      window.removeEventListener('resize', handleResize)
+      clearTimeout(timeoutId)
+    }
+  }, [])
+
+  const statusColorMap = {
+    solved: '#10B981',
+    ongoing: '#F59E0B',
+    unexplored: '#EF4444',
+  }
+
+  const paintNode = useCallback((node, ctx) => {
+    const size = Math.max(4, (node.val || 10) / 4)
+    ctx.beginPath()
+    ctx.arc(node.x, node.y, size, 0, 2 * Math.PI)
+    ctx.fillStyle = statusColorMap[node.status] || '#94A3B8'
+    ctx.fill()
+    ctx.strokeStyle = '#FFFFFF'
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+    ctx.font = `${Math.max(10, size)}px Inter`
+    ctx.fillStyle = '#1F2937'
+    ctx.fillText(node.label, node.x + size + 2, node.y - 4)
+  }, [statusColorMap])
+
+  if (isLoading) {
+    return (
+      <div className="glass-card rounded-2xl p-6">
+        <div className="h-[500px] flex items-center justify-center">
+          <div className="text-center">
+            <div className="w-12 h-12 border-4 border-purple-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+            <p className="text-gray-500">Loading graph...</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.3 }}
+      className="glass-card rounded-2xl overflow-hidden"
+    >
+      <div className="p-4 border-b border-white/20">
+        <h3 className="text-lg font-semibold">Research Knowledge Map</h3>
+        <p className="text-sm text-gray-500">Drag to explore â€“ click on a node</p>
+      </div>
+      
+      <div id="graph-container" className="w-full h-[500px]">
+        <ForceGraph2D
+          ref={graphRef}
+          graphData={data}
+          width={dimensions.width}
+          height={dimensions.height}
+          nodeLabel="label"
+          nodeCanvasObject={paintNode}
+          nodeVal={node => node.val || 10}
+          linkWidth={link => Math.sqrt(link.value || 1) / 10}
+          linkColor={() => 'rgba(156, 163, 175, 0.3)'}
+          onNodeClick={onNodeClick}
+          cooldownTicks={50}
+          warmupTicks={50}
+          d3VelocityDecay={0.2}
+          enablePanInteraction={true}
+          enableZoomInteraction={true}
+        />
+      </div>
+
+      <div className="p-3 border-t border-white/20 flex justify-center gap-4 text-xs">
+        <div className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500"></span> Solved</div>
+        <div className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-yellow-500"></span> Ongoing</div>
+        <div className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500"></span> Unexplored</div>
+      </div>
+    </motion.div>
+  )
+}
+
+export default React.memo(KnowledgeGraph)
+
+
+================================================
+FILE: frontend/src/components/Layout.jsx
+================================================
+import { useState, useEffect } from 'react'
+import { Link, useLocation } from 'react-router-dom'
+import { motion } from 'framer-motion'
+import { Search, Menu, X, Moon, Sun, Home, LayoutDashboard } from 'lucide-react'
+
+const Layout = ({ children }) => {
+  const [isDark, setIsDark] = useState(false)
+  const [isMenuOpen, setIsMenuOpen] = useState(false)
+  const location = useLocation()
+
+  useEffect(() => {
+    if (isDark) {
+      document.documentElement.classList.add('dark')
+    } else {
+      document.documentElement.classList.remove('dark')
+    }
+  }, [isDark])
+
+  const navItems = [
+    { path: '/', icon: Home, label: 'Home' },
+    { path: '/dashboard/ai', icon: LayoutDashboard, label: 'Dashboard' },
+  ]
+
+  return (
+    <div className="min-h-screen">
+      {/* Glassmorphism Navbar */}
+      <nav className="fixed top-0 left-0 right-0 z-50 glass-card backdrop-blur-xl bg-white/70 dark:bg-gray-900/70 border-b border-white/20">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center h-16">
+            <div className="flex items-center space-x-4">
+              <Link to="/" className="flex items-center space-x-2 group">
+                <div className="w-8 h-8 bg-gradient-to-r from-purple-600 to-pink-600 rounded-lg transform rotate-45 group-hover:rotate-90 transition-transform duration-300"></div>
+                <span className="text-xl font-bold gradient-text">Research Tracker</span>
+              </Link>
+            </div>
+
+            {/* Desktop Navigation */}
+            <div className="hidden md:flex items-center space-x-6">
+              {navItems.map((item) => (
+                <Link
+                  key={item.path}
+                  to={item.path}
+                  className={`flex items-center space-x-2 px-3 py-2 rounded-lg transition-all duration-200 ${
+                    location.pathname === item.path
+                      ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400'
+                      : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  <item.icon className="w-4 h-4" />
+                  <span>{item.label}</span>
+                </Link>
+              ))}
+              
+              <button
+                onClick={() => setIsDark(!isDark)}
+                className="p-2 rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+              >
+                {isDark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+              </button>
+            </div>
+
+            {/* Mobile Menu Button */}
+            <button
+              onClick={() => setIsMenuOpen(!isMenuOpen)}
+              className="md:hidden p-2 rounded-lg bg-gray-100 dark:bg-gray-800"
+            >
+              {isMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Mobile Navigation */}
+        {isMenuOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="md:hidden glass-card bg-white/95 dark:bg-gray-900/95 border-t border-white/20"
+          >
+            <div className="px-4 py-3 space-y-2">
+              {navItems.map((item) => (
+                <Link
+                  key={item.path}
+                  to={item.path}
+                  onClick={() => setIsMenuOpen(false)}
+                  className={`flex items-center space-x-3 px-4 py-3 rounded-lg transition-all ${
+                    location.pathname === item.path
+                      ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-600'
+                      : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  <item.icon className="w-5 h-5" />
+                  <span>{item.label}</span>
+                </Link>
+              ))}
+              <button
+                onClick={() => setIsDark(!isDark)}
+                className="flex items-center space-x-3 w-full px-4 py-3 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800"
+              >
+                {isDark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+                <span>{isDark ? 'Light Mode' : 'Dark Mode'}</span>
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </nav>
+
+      {/* Main Content */}
+      <main className="pt-20 pb-12 px-4 sm:px-6 lg:px-8">
+        <div className="max-w-7xl mx-auto">
+          {children}
+        </div>
+      </main>
+    </div>
+  )
+}
+
+export default Layout
+
+
+================================================
+FILE: frontend/src/components/PaperDetailModal.jsx
+================================================
+import { motion, AnimatePresence } from 'framer-motion'
+import { X, ExternalLink, Calendar, User, Quote } from 'lucide-react'
+
+const PaperDetailModal = ({ isOpen, onClose, papers, title }) => {
+  if (!isOpen) return null
+
+  return (
+    <AnimatePresence>
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          onClick={onClose}
+          className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+        />
+        
+        <motion.div
+          initial={{ opacity: 0, scale: 0.9, y: 20 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.9, y: 20 }}
+          className="relative glass-card rounded-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden shadow-2xl"
+        >
+          <div className="p-6 border-b border-white/20 flex justify-between items-center">
+            <div>
+              <h3 className="text-xl font-bold text-gray-800 dark:text-white">
+                Research Papers
+              </h3>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                Related to: {title}
+              </p>
+            </div>
+            <button
+              onClick={onClose}
+              className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          
+          <div className="p-6 overflow-y-auto max-h-[calc(80vh-120px)]">
+            <div className="space-y-4">
+              {papers.map((paper, index) => (
+                <motion.div
+                  key={index}
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: index * 0.1 }}
+                  className="glass-card p-4 rounded-xl"
+                >
+                  <h4 className="font-semibold text-gray-800 dark:text-white mb-2">
+                    {paper.title}
+                  </h4>
+                  
+                  <div className="flex flex-wrap gap-4 mb-3 text-sm text-gray-500 dark:text-gray-400">
+                    <div className="flex items-center space-x-1">
+                      <User className="w-3 h-3" />
+                      <span>{paper.authors}</span>
+                    </div>
+                    <div className="flex items-center space-x-1">
+                      <Calendar className="w-3 h-3" />
+                      <span>{paper.year}</span>
+                    </div>
+                    <div className="flex items-center space-x-1">
+                      <Quote className="w-3 h-3" />
+                      <span>{paper.citations.toLocaleString()} citations</span>
+                    </div>
+                  </div>
+                  
+                  <p className="text-sm text-gray-600 dark:text-gray-300 mb-3">
+                    {paper.abstract}
+                  </p>
+                  
+                  <button className="text-purple-600 dark:text-purple-400 text-sm flex items-center space-x-1 hover:underline">
+                    <span>Read more</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </button>
+                </motion.div>
+              ))}
+            </div>
+          </div>
+        </motion.div>
+      </div>
+    </AnimatePresence>
+  )
+}
+
+export default PaperDetailModal
+
+
+================================================
+FILE: frontend/src/components/SummaryCards.jsx
+================================================
+import React from 'react'
+import { motion } from 'framer-motion'
+import { TrendingUp, GraduationCap, AlertTriangle, BookOpen } from 'lucide-react'
+import CountUp from 'react-countup'
+
+const SummaryCards = ({ stats, isLoading = false }) => {
+  const cards = [
+    { title: 'Solved Areas', value: stats?.solved || 0, icon: TrendingUp, color: 'from-emerald-500 to-teal-500' },
+    { title: 'Ongoing Research', value: stats?.ongoing || 0, icon: GraduationCap, color: 'from-yellow-500 to-orange-500' },
+    { title: 'Unexplored Territories', value: stats?.unexplored || 0, icon: AlertTriangle, color: 'from-red-500 to-rose-500' },
+    { title: 'Total Papers', value: stats?.totalPapers || 0, icon: BookOpen, color: 'from-blue-500 to-indigo-500' },
+  ]
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+      {cards.map((card, index) => (
+        <motion.div
+          key={card.title}
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: index * 0.1 }}
+          whileHover={{ scale: 1.02, y: -4 }}
+          className="glass-card-hover p-6 rounded-2xl border border-white/20 transition-all duration-300"
+        >
+          <div className={`w-12 h-12 rounded-xl bg-gradient-to-r ${card.color} flex items-center justify-center shadow-lg mb-4`}>
+            <card.icon className="w-6 h-6 text-white" />
+          </div>
+          <h3 className="text-3xl font-bold text-gray-800 dark:text-white mb-1">
+            {isLoading ? <div className="h-10 w-20 bg-gray-200 dark:bg-gray-700 rounded-lg animate-pulse" /> : <CountUp end={card.value} duration={2} separator="," />}
+          </h3>
+          <p className="text-sm text-gray-500 dark:text-gray-400">{card.title}</p>
+        </motion.div>
+      ))}
+    </div>
+  )
+}
+
+export default SummaryCards
+
+
+================================================
+FILE: frontend/src/components/TrendChart.jsx
+================================================
+import React, { memo } from 'react'
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
+} from 'recharts'
+
+const CustomTooltip = ({ active, payload, label }) => {
+  if (active && payload?.length) {
+    return (
+      <div className="glass-card p-2 text-sm">
+        <p className="font-semibold">{label}</p>
+        <p className="text-purple-600">Papers: {payload[0].value}</p>
+        <p className="text-blue-600">Citations: {payload[1]?.value?.toLocaleString()}</p>
+      </div>
+    )
+  }
+  return null
+}
+
+const TrendChart = ({ data, isLoading }) => {
+  if (isLoading) {
+    return (
+      <div className="glass-card rounded-2xl p-6 h-[340px] flex items-center justify-center">
+        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-purple-500" />
+      </div>
+    )
+  }
+
+  return (
+    <div className="glass-card rounded-2xl p-6">
+      <h3 className="text-lg font-semibold">Publication Trends</h3>
+      <p className="text-sm text-gray-500 mb-4">Papers & citations over time</p>
+      <ResponsiveContainer width="100%" height={280}>
+        <LineChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#E5E7EB" />
+          <XAxis dataKey="year" />
+          <YAxis yAxisId="left" />
+          <YAxis yAxisId="right" orientation="right" />
+          <Tooltip content={<CustomTooltip />} />
+          <Legend />
+          <Line type="monotone" dataKey="papers" stroke="#8B5CF6" yAxisId="left" name="Papers" strokeWidth={2} />
+          <Line type="monotone" dataKey="citations" stroke="#3B82F6" yAxisId="right" name="Citations" strokeWidth={2} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+export default memo(TrendChart)
+
+
+================================================
+FILE: frontend/src/pages/DashboardPage.jsx
+================================================
+import { useState, useEffect, useCallback } from 'react'
+import { useParams } from 'react-router-dom'
+import { motion } from 'framer-motion'
+import SummaryCards from '../components/SummaryCards'
+import KnowledgeGraph from '../components/KnowledgeGraph'
+import TrendChart from '../components/TrendChart'
+import GapList from '../components/GapList'
+import PaperDetailModal from '../components/PaperDetailModal'
+import FloatingAddButton from '../components/FloatingAddButton'
+import { fetchKnowledgeGraph, fetchTrendData, fetchGapList, fetchStats, fetchPapersForNode } from '../api'
+
+const DashboardPage = () => {
+  const { topicId } = useParams()
+  const [graphData, setGraphData] = useState({ nodes: [], links: [] })
+  const [trendData, setTrendData] = useState([])
+  const [gaps, setGaps] = useState([])
+  const [stats, setStats] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [selectedPapers, setSelectedPapers] = useState([])
+  const [selectedTitle, setSelectedTitle] = useState('')
+
+  useEffect(() => {
+    let isMounted = true
+    const loadData = async () => {
+      setLoading(true)
+      try {
+        const [graph, trends, gapsData, statsData] = await Promise.all([
+          fetchKnowledgeGraph(topicId),
+          fetchTrendData(topicId),
+          fetchGapList(topicId),
+          fetchStats(topicId),
+        ])
+        if (isMounted) {
+          setGraphData(graph)
+          setTrendData(trends)
+          setGaps(gapsData)
+          setStats(statsData)
+        }
+      } catch (err) {
+        console.error('Failed to load dashboard data:', err)
+      } finally {
+        if (isMounted) setLoading(false)
+      }
+    }
+    loadData()
+    return () => { isMounted = false }
+  }, [topicId])
+
+  const handleNodeClick = useCallback(async (node) => {
+    const papers = await fetchPapersForNode(node.id)
+    setSelectedPapers(papers)
+    setSelectedTitle(node.label)
+    setModalOpen(true)
+  }, [])
+
+  const handleGapClick = useCallback((gap) => {
+    setSelectedPapers([
+      { title: 'Research on ' + gap.title, authors: 'Various Authors', year: 2024, citations: 250, abstract: gap.description }
+    ])
+    setSelectedTitle(gap.title)
+    setModalOpen(true)
+  }, [])
+
+  const closeModal = useCallback(() => setModalOpen(false), [])
+
+  if (loading) {
+    return (
+      <div className="flex justify-center items-center h-96">
+        <div className="text-center">
+          <div className="w-16 h-16 border-4 border-purple-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-gray-500">Loading research landscape for "{topicId}"...</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-8">
+      <div>
+        <h1 className="text-3xl font-bold gradient-text">Research Landscape: {topicId}</h1>
+        <p className="text-gray-500">Interactive visualization of research areas, trends, and gaps</p>
+      </div>
+
+      <SummaryCards stats={stats} isLoading={loading} />
+      
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2">
+          <KnowledgeGraph data={graphData} onNodeClick={handleNodeClick} isLoading={loading} />
+        </div>
+        <div>
+          <TrendChart data={trendData} isLoading={loading} />
+        </div>
+      </div>
+
+      <GapList gaps={gaps} onGapClick={handleGapClick} isLoading={loading} />
+
+      <PaperDetailModal
+        isOpen={modalOpen}
+        onClose={closeModal}
+        papers={selectedPapers}
+        title={selectedTitle}
+      />
+
+      <FloatingAddButton onClick={() => console.log('Add research')} />
+    </motion.div>
+  )
+}
+
+export default DashboardPage
+
+
+================================================
+FILE: frontend/src/pages/HomePage.jsx
+================================================
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { motion } from 'framer-motion'
+import { Search, TrendingUp, Sparkles, ArrowRight } from 'lucide-react'
+
+const HomePage = () => {
+  const [topic, setTopic] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const navigate = useNavigate()
+
+  const handleSearch = async (e) => {
+    e.preventDefault()
+    if (!topic.trim()) return
+    
+    setIsLoading(true)
+    // Simulate API call
+    setTimeout(() => {
+      setIsLoading(false)
+      navigate(`/dashboard/${encodeURIComponent(topic)}`)
+    }, 1000)
+  }
+
+  const features = [
+    {
+      icon: TrendingUp,
+      title: 'Trend Analysis',
+      description: 'Track research trends and publication patterns over time',
+    },
+    {
+      icon: Sparkles,
+      title: 'Gap Detection',
+      description: 'Identify unexplored territories and research opportunities',
+    },
+    {
+      icon: Search,
+      title: 'Knowledge Mapping',
+      description: 'Visualize research landscape with interactive graphs',
+    },
+  ]
+
+  return (
+    <div className="min-h-[calc(100vh-100px)] flex flex-col items-center justify-center">
+      {/* Hero Section */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.6 }}
+        className="text-center max-w-4xl mx-auto"
+      >
+        <div className="inline-flex items-center space-x-2 px-4 py-2 rounded-full glass-card mb-6">
+          <Sparkles className="w-4 h-4 text-purple-600" />
+          <span className="text-sm font-medium gradient-text">AI-Powered Research Intelligence</span>
+        </div>
+        
+        <h1 className="text-5xl md:text-7xl font-bold mb-6">
+          <span className="gradient-text">Research</span>
+          <br />
+          <span className="text-gray-800 dark:text-white">Landscape Explorer</span>
+        </h1>
+        
+        <p className="text-lg text-gray-600 dark:text-gray-300 mb-8 max-w-2xl mx-auto">
+          Discover research trends, identify gaps, and explore the knowledge graph of any academic field
+        </p>
+
+        {/* Search Form */}
+        <form onSubmit={handleSearch} className="max-w-2xl mx-auto">
+          <div className="relative group">
+            <input
+              type="text"
+              value={topic}
+              onChange={(e) => setTopic(e.target.value)}
+              placeholder="Enter a research topic (e.g., 'Artificial Intelligence', 'Climate Change')"
+              className="w-full px-6 py-4 pl-14 rounded-2xl glass-card bg-white/50 dark:bg-gray-800/50 backdrop-blur-md focus:outline-none focus:ring-2 focus:ring-purple-500 transition-all duration-300 text-gray-800 dark:text-white placeholder-gray-400"
+            />
+            <Search className="absolute left-5 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400 group-focus-within:text-purple-500 transition-colors" />
+            
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="absolute right-2 top-1/2 transform -translate-y-1/2 px-6 py-2 bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-xl font-medium hover:shadow-lg transition-all duration-300 disabled:opacity-50"
+            >
+              {isLoading ? (
+                <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              ) : (
+                'Explore'
+              )}
+            </button>
+          </div>
+        </form>
+      </motion.div>
+
+      {/* Features */}
+      <motion.div
+        initial={{ opacity: 0, y: 40 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.6, delay: 0.3 }}
+        className="mt-20 grid grid-cols-1 md:grid-cols-3 gap-6 max-w-5xl mx-auto"
+      >
+        {features.map((feature, index) => (
+          <motion.div
+            key={feature.title}
+            whileHover={{ y: -5 }}
+            className="glass-card p-6 rounded-2xl text-center group cursor-pointer"
+          >
+            <div className="w-14 h-14 bg-gradient-to-r from-purple-600 to-pink-600 rounded-xl flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform">
+              <feature.icon className="w-7 h-7 text-white" />
+            </div>
+            <h3 className="text-lg font-semibold text-gray-800 dark:text-white mb-2">
+              {feature.title}
+            </h3>
+            <p className="text-sm text-gray-500 dark:text-gray-400">
+              {feature.description}
+            </p>
+          </motion.div>
+        ))}
+      </motion.div>
+
+      {/* Quick Stats */}
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: 0.6, delay: 0.6 }}
+        className="mt-16 text-center"
+      >
+        <div className="flex flex-wrap justify-center gap-8">
+          <div className="text-center">
+            <div className="text-2xl font-bold gradient-text">10K+</div>
+            <div className="text-sm text-gray-500 dark:text-gray-400">Research Papers</div>
+          </div>
+          <div className="text-center">
+            <div className="text-2xl font-bold gradient-text">50+</div>
+            <div className="text-sm text-gray-500 dark:text-gray-400">Academic Fields</div>
+          </div>
+          <div className="text-center">
+            <div className="text-2xl font-bold gradient-text">100K+</div>
+            <div className="text-sm text-gray-500 dark:text-gray-400">Citations Tracked</div>
+          </div>
+        </div>
+      </motion.div>
+    </div>
+  )
+}
+
+export default HomePage
+
