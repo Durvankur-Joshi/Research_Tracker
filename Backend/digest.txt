@@ -1,0 +1,556 @@
+Directory structure:
+└── Backend/
+    ├── requirements.txt
+    └── app/
+        ├── main.py
+        ├── models/
+        │   └── schema.py
+        ├── routes/
+        │   └── research.py
+        ├── services/
+        │   ├── analysis_service.py
+        │   ├── arxiv_service.py
+        │   ├── clustering_service.py
+        │   ├── embedding_service.py
+        │   └── insight_service.py
+        └── utils/
+            └── text_cleaner.py
+
+================================================
+FILE: requirements.txt
+================================================
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+httpx==0.27.0
+sentence-transformers==2.7.0
+scikit-learn==1.4.2
+numpy==1.26.4
+pydantic==2.7.1
+python-dotenv==1.0.1
+
+
+================================================
+FILE: app/main.py
+================================================
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.routes.research import router
+
+app = FastAPI(
+    title="Research Radar API",
+    description="AI-powered research gap detection engine",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router, prefix="/api")
+
+@app.get("/")
+def root():
+    return {"message": "Research Radar API is live ðŸš€"}
+
+
+================================================
+FILE: app/models/schema.py
+================================================
+from pydantic import BaseModel
+from typing import List, Optional
+
+class TopicRequest(BaseModel):
+    topic: str
+    max_papers: Optional[int] = 50
+    num_clusters: Optional[int] = 5
+
+class PaperSchema(BaseModel):
+    title: str
+    abstract: str
+    year: int
+
+class ClusterSchema(BaseModel):
+    id: int
+    name: str
+    papers: int
+    status: str  # "Mature" | "Growing" | "Gap"
+    top_keywords: List[str]
+    recent_ratio: float
+
+class InsightSchema(BaseModel):
+    cluster_id: int
+    cluster_name: str
+    insight: str
+
+class AnalysisResponse(BaseModel):
+    topic: str
+    total_papers: int
+    clusters: List[ClusterSchema]
+    insights: List[InsightSchema]
+
+
+================================================
+FILE: app/routes/research.py
+================================================
+from fastapi import APIRouter, HTTPException
+from app.models.schema import TopicRequest, AnalysisResponse, ClusterSchema, InsightSchema
+from app.services.arxiv_service import fetch_papers
+from app.services.embedding_service import generate_embeddings
+from app.services.clustering_service import cluster_papers, build_clusters
+from app.services.analysis_service import analyze_clusters
+from app.services.insight_service import generate_all_insights
+from app.utils.text_cleaner import clean_papers
+import numpy as np
+
+router = APIRouter()
+
+
+@router.post("/analyze-topic", response_model=AnalysisResponse)
+async def analyze_topic(request: TopicRequest):
+    """
+    Full pipeline:
+    1. Fetch papers from arXiv
+    2. Clean text
+    3. Generate embeddings
+    4. Cluster papers
+    5. Analyze cluster status
+    6. Generate LLM insights
+    7. Return structured response
+    """
+    # Step 1: Fetch papers
+    papers = await fetch_papers(request.topic, max_results=request.max_papers)
+    if not papers:
+        raise HTTPException(status_code=404, detail=f"No papers found for topic: {request.topic}")
+
+    # Step 2: Clean text
+    papers = clean_papers(papers)
+
+    # Step 3: Embed
+    texts = [p["text"] for p in papers]
+    embeddings = generate_embeddings(texts)
+
+    # Step 4: Cluster
+    n_clusters = min(request.num_clusters, len(papers))
+    labels = cluster_papers(embeddings, n_clusters=n_clusters)
+    clusters = build_clusters(papers, labels, n_clusters)
+
+    # Step 5: Analyze status
+    analyzed = analyze_clusters(clusters)
+
+    # Step 6: Generate insights
+    insights_data = await generate_all_insights(analyzed)
+
+    # Step 7: Build response
+    cluster_schemas = [
+        ClusterSchema(
+            id=c["id"],
+            name=c["name"],
+            papers=c["paper_count"],
+            status=c["status"],
+            top_keywords=c.get("keywords", []),
+            recent_ratio=c["recent_ratio"]
+        )
+        for c in analyzed
+    ]
+
+    insight_schemas = [
+        InsightSchema(
+            cluster_id=i["cluster_id"],
+            cluster_name=i["cluster_name"],
+            insight=i["insight"]
+        )
+        for i in insights_data
+    ]
+
+    return AnalysisResponse(
+        topic=request.topic,
+        total_papers=len(papers),
+        clusters=cluster_schemas,
+        insights=insight_schemas
+    )
+
+
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+================================================
+FILE: app/services/analysis_service.py
+================================================
+from typing import List, Dict
+from datetime import datetime
+
+CURRENT_YEAR = datetime.now().year
+RECENT_THRESHOLD = CURRENT_YEAR - 4  # Last 4 years = "recent"
+
+
+def classify_status(paper_count: int, recent_count: int) -> str:
+    """
+    Core hackathon logic to classify research maturity.
+    
+    - Mature: well-researched area (many papers)
+    - Growing: emerging field (mostly recent papers)
+    - Gap: underexplored area (few papers, mostly old)
+    """
+    if paper_count == 0:
+        return "Gap"
+
+    recent_ratio = recent_count / paper_count
+
+    if paper_count > 20:
+        return "Mature"
+    elif recent_ratio > 0.6:
+        return "Growing"
+    else:
+        return "Gap"
+
+
+def analyze_clusters(clusters: List[Dict]) -> List[Dict]:
+    """
+    Analyze each cluster and attach status, recent_ratio to each.
+    """
+    analyzed = []
+
+    for cluster in clusters:
+        papers = cluster["papers"]
+        paper_count = len(papers)
+        recent_count = sum(1 for p in papers if p.get("year", 0) >= RECENT_THRESHOLD)
+        recent_ratio = round(recent_count / paper_count, 2) if paper_count > 0 else 0.0
+
+        status = classify_status(paper_count, recent_count)
+
+        analyzed.append({
+            **cluster,
+            "paper_count": paper_count,
+            "recent_count": recent_count,
+            "recent_ratio": recent_ratio,
+            "status": status
+        })
+
+    return analyzed
+
+
+================================================
+FILE: app/services/arxiv_service.py
+================================================
+import httpx
+import xml.etree.ElementTree as ET
+from typing import List, Dict
+from datetime import datetime
+
+ARXIV_BASE_URL = "http://export.arxiv.org/api/query"
+
+async def fetch_papers(topic: str, max_results: int = 50) -> List[Dict]:
+    """
+    Fetch papers from arXiv API for a given topic.
+    Returns list of {title, abstract, year} dicts.
+    """
+    params = {
+        "search_query": f"all:{topic}",
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "relevance",
+        "sortOrder": "descending"
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(ARXIV_BASE_URL, params=params)
+        response.raise_for_status()
+
+    papers = _parse_arxiv_xml(response.text)
+    return papers
+
+
+def _parse_arxiv_xml(xml_text: str) -> List[Dict]:
+    """Parse arXiv Atom XML and extract title, abstract, year."""
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom"
+    }
+
+    root = ET.fromstring(xml_text)
+    papers = []
+
+    for entry in root.findall("atom:entry", ns):
+        title_el = entry.find("atom:title", ns)
+        abstract_el = entry.find("atom:summary", ns)
+        published_el = entry.find("atom:published", ns)
+
+        if title_el is None or abstract_el is None:
+            continue
+
+        title = title_el.text.strip().replace("\n", " ")
+        abstract = abstract_el.text.strip().replace("\n", " ")
+
+        year = datetime.now().year
+        if published_el is not None:
+            try:
+                year = int(published_el.text[:4])
+            except (ValueError, TypeError):
+                pass
+
+        papers.append({
+            "title": title,
+            "abstract": abstract,
+            "year": year,
+            "text": f"{title}. {abstract}"
+        })
+
+    return papers
+
+
+================================================
+FILE: app/services/clustering_service.py
+================================================
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
+from typing import List, Dict, Tuple
+
+
+def cluster_papers(embeddings: np.ndarray, n_clusters: int = 5) -> np.ndarray:
+    """
+    Cluster paper embeddings using KMeans.
+    Returns array of cluster labels.
+    """
+    n_clusters = min(n_clusters, len(embeddings))
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        random_state=42,
+        n_init=10
+    )
+    labels = kmeans.fit_predict(embeddings)
+    return labels
+
+
+def extract_cluster_keywords(papers: List[Dict], labels: np.ndarray, cluster_id: int, top_n: int = 5) -> List[str]:
+    """
+    Extract top TF-IDF keywords for a specific cluster.
+    """
+    cluster_texts = [
+        p["text"] for p, label in zip(papers, labels) if label == cluster_id
+    ]
+
+    if not cluster_texts:
+        return []
+
+    try:
+        vectorizer = TfidfVectorizer(
+            max_features=100,
+            stop_words='english',
+            ngram_range=(1, 2)
+        )
+        tfidf_matrix = vectorizer.fit_transform(cluster_texts)
+        feature_names = vectorizer.get_feature_names_out()
+        mean_scores = np.asarray(tfidf_matrix.mean(axis=0)).flatten()
+        top_indices = mean_scores.argsort()[-top_n:][::-1]
+        keywords = [feature_names[i] for i in top_indices]
+        return keywords
+    except Exception:
+        return []
+
+
+def name_cluster(keywords: List[str]) -> str:
+    """
+    Generate a human-readable cluster name from keywords.
+    Capitalizes the top 2-3 keywords.
+    """
+    if not keywords:
+        return "General Research"
+    # Use top 2 keywords, title-cased
+    name_parts = [k.title() for k in keywords[:2]]
+    return " & ".join(name_parts)
+
+
+def build_clusters(papers: List[Dict], labels: np.ndarray, n_clusters: int) -> List[Dict]:
+    """
+    Build cluster summary dicts with names, paper lists, and metadata.
+    """
+    clusters = []
+    for cluster_id in range(n_clusters):
+        cluster_papers = [
+            p for p, label in zip(papers, labels) if label == cluster_id
+        ]
+        if not cluster_papers:
+            continue
+
+        keywords = extract_cluster_keywords(papers, labels, cluster_id)
+        name = name_cluster(keywords)
+
+        clusters.append({
+            "id": cluster_id,
+            "name": name,
+            "papers": cluster_papers,
+            "keywords": keywords
+        })
+
+    return clusters
+
+
+================================================
+FILE: app/services/embedding_service.py
+================================================
+from sentence_transformers import SentenceTransformer
+from typing import List
+import numpy as np
+
+# Load once at module level (cached after first load)
+_model = None
+
+def get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        print("Loading embedding model... (first time only)")
+        _model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _model
+
+
+def generate_embeddings(texts: List[str]) -> np.ndarray:
+    """
+    Convert list of texts into embedding vectors.
+    Returns numpy array of shape (n_texts, embedding_dim).
+    """
+    model = get_model()
+    embeddings = model.encode(
+        texts,
+        batch_size=32,
+        show_progress_bar=False,
+        normalize_embeddings=True
+    )
+    return embeddings
+
+
+================================================
+FILE: app/services/insight_service.py
+================================================
+import httpx
+import os
+from typing import List, Dict
+
+# Use HuggingFace free Inference API (no key needed for public models)
+HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
+HF_TOKEN = os.getenv("HF_TOKEN", "")  # Optional: set for higher rate limits
+
+
+def _build_prompt(cluster: Dict) -> str:
+    topic_name = cluster["name"]
+    status = cluster["status"]
+    keywords = ", ".join(cluster.get("keywords", []))
+    paper_count = cluster["paper_count"]
+    recent_ratio = cluster["recent_ratio"]
+
+    return f"""<s>[INST] You are a research analyst. Given the following research cluster data, generate ONE concise insight (2 sentences max) about the research landscape.
+
+Cluster: {topic_name}
+Status: {status}
+Key topics: {keywords}
+Papers found: {paper_count}
+Recent paper ratio: {recent_ratio:.0%}
+
+For Gap clusters: highlight the opportunity and why it matters.
+For Growing clusters: highlight the momentum and emerging potential.
+For Mature clusters: highlight what's well-understood and possible next frontiers.
+
+Respond with ONLY the insight, no labels or preamble. [/INST]"""
+
+
+async def generate_insight_hf(cluster: Dict) -> str:
+    """Generate insight using HuggingFace free inference."""
+    prompt = _build_prompt(cluster)
+    headers = {"Content-Type": "application/json"}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 100,
+            "temperature": 0.7,
+            "return_full_text": False
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(HF_API_URL, json=payload, headers=headers)
+            result = response.json()
+            if isinstance(result, list) and result:
+                return result[0].get("generated_text", "").strip()
+    except Exception as e:
+        print(f"HF API error: {e}")
+
+    # Fallback: rule-based insight if LLM fails
+    return _fallback_insight(cluster)
+
+
+def _fallback_insight(cluster: Dict) -> str:
+    """Rule-based fallback insights when LLM is unavailable."""
+    name = cluster["name"]
+    status = cluster["status"]
+    keywords = cluster.get("keywords", [])
+    kw = keywords[0] if keywords else "this area"
+
+    if status == "Gap":
+        return (
+            f"'{name}' is significantly underexplored with only {cluster['paper_count']} papers. "
+            f"There is a clear research opportunity in {kw}, especially given low recent activity."
+        )
+    elif status == "Growing":
+        return (
+            f"'{name}' is gaining rapid momentum with {cluster['recent_ratio']:.0%} of papers from recent years. "
+            f"Early researchers in {kw} can establish themselves in this emerging area."
+        )
+    else:
+        return (
+            f"'{name}' is a well-established field with {cluster['paper_count']} papers. "
+            f"Future work could explore intersections of {kw} with adjacent emerging domains."
+        )
+
+
+async def generate_all_insights(analyzed_clusters: List[Dict]) -> List[Dict]:
+    """Generate insights for all clusters, prioritizing Gap and Growing ones."""
+    insights = []
+    for cluster in analyzed_clusters:
+        insight_text = await generate_insight_hf(cluster)
+        insights.append({
+            "cluster_id": cluster["id"],
+            "cluster_name": cluster["name"],
+            "status": cluster["status"],
+            "insight": insight_text
+        })
+    return insights
+
+
+================================================
+FILE: app/utils/text_cleaner.py
+================================================
+import re
+from typing import List, Dict
+
+def clean_text(text: str) -> str:
+    """Remove LaTeX, special chars, and normalize whitespace."""
+    # Remove LaTeX math blocks
+    text = re.sub(r'\$[^$]*\$', '', text)
+    text = re.sub(r'\\\w+\{[^}]*\}', '', text)
+    # Remove special characters except periods and commas
+    text = re.sub(r'[^\w\s.,;:()\-]', ' ', text)
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def clean_papers(papers: List[Dict]) -> List[Dict]:
+    """Clean text field for all papers."""
+    cleaned = []
+    for p in papers:
+        p_copy = p.copy()
+        p_copy["text"] = clean_text(p["text"])
+        p_copy["title"] = clean_text(p["title"])
+        p_copy["abstract"] = clean_text(p["abstract"])
+        cleaned.append(p_copy)
+    return cleaned
+
