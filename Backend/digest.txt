@@ -27,6 +27,7 @@ scikit-learn==1.4.2
 numpy==1.26.4
 pydantic==2.7.1
 python-dotenv==1.0.1
+google-generativeai
 
 
 ================================================
@@ -243,7 +244,7 @@ import xml.etree.ElementTree as ET
 from typing import List, Dict
 from datetime import datetime
 
-ARXIV_BASE_URL = "http://export.arxiv.org/api/query"
+ARXIV_BASE_URL = "https://export.arxiv.org/api/query"
 
 async def fetch_papers(topic: str, max_results: int = 50) -> List[Dict]:
     """
@@ -428,13 +429,23 @@ def generate_embeddings(texts: List[str]) -> np.ndarray:
 ================================================
 FILE: app/services/insight_service.py
 ================================================
-import httpx
 import os
+import asyncio
 from typing import List, Dict
+from dotenv import load_dotenv
+import google.generativeai as genai
 
-# Use HuggingFace free Inference API (no key needed for public models)
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
-HF_TOKEN = os.getenv("HF_TOKEN", "")  # Optional: set for higher rate limits
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Initialize model
+model = genai.GenerativeModel("gemini-2.5-flash")
+
+# ðŸ”¥ Limit API usage (IMPORTANT)
+MAX_LLM_CALLS = 2
 
 
 def _build_prompt(cluster: Dict) -> str:
@@ -444,7 +455,10 @@ def _build_prompt(cluster: Dict) -> str:
     paper_count = cluster["paper_count"]
     recent_ratio = cluster["recent_ratio"]
 
-    return f"""<s>[INST] You are a research analyst. Given the following research cluster data, generate ONE concise insight (2 sentences max) about the research landscape.
+    return f"""
+You are a research analyst.
+
+Given the following research cluster data, generate ONE concise insight (max 2 sentences).
 
 Cluster: {topic_name}
 Status: {status}
@@ -452,44 +466,33 @@ Key topics: {keywords}
 Papers found: {paper_count}
 Recent paper ratio: {recent_ratio:.0%}
 
-For Gap clusters: highlight the opportunity and why it matters.
-For Growing clusters: highlight the momentum and emerging potential.
-For Mature clusters: highlight what's well-understood and possible next frontiers.
+Instructions:
+- If Gap â†’ highlight opportunity
+- If Growing â†’ highlight momentum
+- If Mature â†’ highlight next direction
 
-Respond with ONLY the insight, no labels or preamble. [/INST]"""
+Return ONLY the insight.
+"""
 
 
-async def generate_insight_hf(cluster: Dict) -> str:
-    """Generate insight using HuggingFace free inference."""
+# âœ… FIX 1 + FIX 2: async-safe Gemini call
+async def generate_insight_gemini(cluster: Dict) -> str:
     prompt = _build_prompt(cluster)
-    headers = {"Content-Type": "application/json"}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
-
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 100,
-            "temperature": 0.7,
-            "return_full_text": False
-        }
-    }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(HF_API_URL, json=payload, headers=headers)
-            result = response.json()
-            if isinstance(result, list) and result:
-                return result[0].get("generated_text", "").strip()
-    except Exception as e:
-        print(f"HF API error: {e}")
+        # ðŸ”¥ run blocking call in thread
+        response = await asyncio.to_thread(model.generate_content, prompt)
 
-    # Fallback: rule-based insight if LLM fails
+        if response and hasattr(response, "text"):
+            return response.text.strip()
+
+    except Exception as e:
+        print(f"Gemini API error: {e}")
+
     return _fallback_insight(cluster)
 
 
 def _fallback_insight(cluster: Dict) -> str:
-    """Rule-based fallback insights when LLM is unavailable."""
     name = cluster["name"]
     status = cluster["status"]
     keywords = cluster.get("keywords", [])
@@ -497,32 +500,46 @@ def _fallback_insight(cluster: Dict) -> str:
 
     if status == "Gap":
         return (
-            f"'{name}' is significantly underexplored with only {cluster['paper_count']} papers. "
-            f"There is a clear research opportunity in {kw}, especially given low recent activity."
+            f"'{name}' is underexplored with only {cluster['paper_count']} papers. "
+            f"This presents a strong research opportunity in {kw}."
         )
     elif status == "Growing":
         return (
-            f"'{name}' is gaining rapid momentum with {cluster['recent_ratio']:.0%} of papers from recent years. "
-            f"Early researchers in {kw} can establish themselves in this emerging area."
+            f"'{name}' is gaining momentum with {cluster['recent_ratio']:.0%} recent papers. "
+            f"This is an emerging area worth exploring."
         )
     else:
         return (
             f"'{name}' is a well-established field with {cluster['paper_count']} papers. "
-            f"Future work could explore intersections of {kw} with adjacent emerging domains."
+            f"Future work could explore advanced applications in {kw}."
         )
 
 
+# âœ… FIX 3: priority sorting + correct function call
 async def generate_all_insights(analyzed_clusters: List[Dict]) -> List[Dict]:
-    """Generate insights for all clusters, prioritizing Gap and Growing ones."""
     insights = []
-    for cluster in analyzed_clusters:
-        insight_text = await generate_insight_hf(cluster)
+
+    # ðŸ”¥ Prioritize important clusters
+    priority_order = {"Gap": 0, "Growing": 1, "Mature": 2}
+    sorted_clusters = sorted(
+        analyzed_clusters,
+        key=lambda c: priority_order.get(c["status"], 3)
+    )
+
+    for i, cluster in enumerate(sorted_clusters):
+        if i < MAX_LLM_CALLS:
+            # âœ… FIX 4: correct function name
+            insight_text = await generate_insight_gemini(cluster)
+        else:
+            insight_text = _fallback_insight(cluster)
+
         insights.append({
             "cluster_id": cluster["id"],
             "cluster_name": cluster["name"],
             "status": cluster["status"],
             "insight": insight_text
         })
+
     return insights
 
 
